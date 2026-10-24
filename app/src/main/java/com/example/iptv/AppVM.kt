@@ -110,7 +110,7 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         prefs.save(saved)
     }
 
-    fun setSort(m: SortMode) {
+        fun changeSort(m: SortMode) {
         sort = m
         prefs.saveSort(m)
     }
