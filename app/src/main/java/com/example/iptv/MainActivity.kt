@@ -252,7 +252,7 @@ fun HomeScreen(vm: AppVM, isTv: Boolean) {
         }
         // Orden alfabético y por fecha + acciones
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(SortMode.values()) { m -> Chip(m.label, vm.sort == m) { vm.setSort(m) } }
+items(SortMode.values()) { m -> Chip(m.label, vm.sort == m) { vm.changeSort(m) } }
             item { Chip("Actualizar") { vm.refresh() } }
             item { Chip("Salir") { vm.logout() } }
         }
