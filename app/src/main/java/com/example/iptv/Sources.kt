@@ -1,12 +1,15 @@
 package com.example.iptv
 
 import android.util.Base64
+import android.util.JsonReader
+import android.util.JsonToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.InputStreamReader
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -62,22 +65,75 @@ private val http: OkHttpClient by lazy {
 
 private const val CACHE_TTL_MS = 6L * 60 * 60 * 1000   // las listas se reutilizan 6 horas
 
+/** Descarga corta (respuestas pequeñas: login, episodios, guía). */
 private fun download(url: String): String =
     http.newCall(Request.Builder().url(url).build()).execute().use { r ->
         if (!r.isSuccessful) error("El servidor respondió HTTP ${r.code}")
         r.body?.string() ?: error("Respuesta vacía del servidor")
     }
 
-private suspend fun cachedText(cacheDir: File?, url: String, force: Boolean): String =
+/**
+ * Descarga listas grandes directo a un archivo, sin cargarlas completas en memoria
+ * (las listas de series pueden pesar decenas de MB y cerraban la app por falta de memoria).
+ */
+private suspend fun cachedFile(cacheDir: File, url: String, force: Boolean): File =
     withContext(Dispatchers.IO) {
-        val f = cacheDir?.let { File(it, "src_${url.hashCode()}.txt") }
-        if (!force && f != null && f.exists() && System.currentTimeMillis() - f.lastModified() < CACHE_TTL_MS) {
-            return@withContext f.readText()
+        val f = File(cacheDir, "src_${url.hashCode()}.txt")
+        if (!force && f.exists() && f.length() > 0 &&
+            System.currentTimeMillis() - f.lastModified() < CACHE_TTL_MS
+        ) {
+            return@withContext f
         }
-        val text = download(url)
-        if (f != null) runCatching { f.writeText(text) }
-        text
+        val tmp = File(cacheDir, f.name + ".tmp")
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            if (!r.isSuccessful) error("El servidor respondió HTTP ${r.code}")
+            val body = r.body ?: error("Respuesta vacía del servidor")
+            body.byteStream().use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
+        }
+        if (f.exists()) f.delete()
+        if (!tmp.renameTo(f)) error("No se pudo guardar la lista en el dispositivo")
+        f
     }
+
+/**
+ * Lee un arreglo JSON grande en streaming, guardando solo los campos pedidos de cada objeto.
+ * Así no se construye todo el árbol JSON en memoria.
+ */
+private fun parseArray(file: File, wanted: Set<String>): List<Map<String, String>> {
+    val out = ArrayList<Map<String, String>>()
+    JsonReader(InputStreamReader(file.inputStream().buffered(), Charsets.UTF_8)).use { r ->
+        r.isLenient = true
+        if (r.peek() != JsonToken.BEGIN_ARRAY) return out
+        r.beginArray()
+        while (r.hasNext()) {
+            if (r.peek() != JsonToken.BEGIN_OBJECT) {
+                r.skipValue()
+                continue
+            }
+            val m = HashMap<String, String>(8)
+            r.beginObject()
+            while (r.hasNext()) {
+                val name = r.nextName()
+                val t = r.peek()
+                if (name in wanted && (t == JsonToken.STRING || t == JsonToken.NUMBER)) {
+                    m[name] = r.nextString()
+                } else {
+                    r.skipValue()
+                }
+            }
+            r.endObject()
+            out.add(m)
+        }
+        r.endArray()
+    }
+    return out
+}
+
+private val ITEM_KEYS = setOf(
+    "series_id", "stream_id", "name", "cover", "stream_icon",
+    "added", "last_modified", "category_id", "container_extension"
+)
+private val CAT_KEYS = setOf("category_id", "category_name")
 
 private fun JsonObject.s(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
@@ -105,7 +161,7 @@ class XtreamApi(
     server: String,
     private val user: String,
     private val pass: String,
-    private val cacheDir: File?
+    private val cacheDir: File
 ) : IptvSource {
 
     private val base = server.trimEnd('/')
@@ -116,8 +172,9 @@ class XtreamApi(
         "$base/player_api.php?username=${enc(user)}&password=${enc(pass)}" +
             (if (action != null) "&action=$action" else "") + extra
 
-    private suspend fun json(url: String, force: Boolean = false, cache: Boolean = false): JsonElement {
-        val text = if (cache) cachedText(cacheDir, url, force) else withContext(Dispatchers.IO) { download(url) }
+    /** Para respuestas pequeñas. */
+    private suspend fun json(url: String): JsonElement {
+        val text = withContext(Dispatchers.IO) { download(url) }
         return withContext(Dispatchers.Default) {
             try {
                 Json.parseToJsonElement(text)
@@ -139,10 +196,16 @@ class XtreamApi(
             Section.MOVIES -> "get_vod_categories"
             Section.SERIES -> "get_series_categories"
         }
-        val arr = json(api(action), force, cache = true) as? JsonArray ?: return emptyList()
-        return arr.map {
-            val o = it.jsonObject
-            Category(o.s("category_id") ?: "", o.s("category_name") ?: "Sin nombre")
+        val f = cachedFile(cacheDir, api(action), force)
+        return withContext(Dispatchers.Default) {
+            try {
+                parseArray(f, CAT_KEYS).map {
+                    Category(it["category_id"] ?: "", it["category_name"] ?: "Sin nombre")
+                }.distinctBy { it.id }
+            } catch (e: Exception) {
+                f.delete()
+                error("El servidor no devolvió datos válidos (revisa la URL)")
+            }
         }
     }
 
@@ -152,22 +215,26 @@ class XtreamApi(
             Section.MOVIES -> "get_vod_streams"
             Section.SERIES -> "get_series"
         }
-        val arr = json(api(action), force, cache = true) as? JsonArray ?: return emptyList()
+        val f = cachedFile(cacheDir, api(action), force)
         return withContext(Dispatchers.Default) {
-            arr.mapNotNull { el ->
-                val o = el.jsonObject
-                val id = (if (sec == Section.SERIES) o.s("series_id") else o.s("stream_id"))
-                    ?: return@mapNotNull null
-                Item(
-                    id = id,
-                    name = o.s("name") ?: "Sin nombre",
-                    icon = (if (sec == Section.SERIES) o.s("cover") else o.s("stream_icon"))
-                        ?.takeIf { it.isNotBlank() },
-                    added = (o.s("added") ?: o.s("last_modified"))?.toLongOrNull() ?: 0L,
-                    categoryId = o.s("category_id") ?: "",
-                    ext = o.s("container_extension") ?: "mp4",
-                    section = sec
-                )
+            try {
+                parseArray(f, ITEM_KEYS).mapNotNull { o ->
+                    val id = (if (sec == Section.SERIES) o["series_id"] else o["stream_id"])
+                        ?: return@mapNotNull null
+                    Item(
+                        id = id,
+                        name = o["name"] ?: "Sin nombre",
+                        icon = (if (sec == Section.SERIES) o["cover"] else o["stream_icon"])
+                            ?.takeIf { it.isNotBlank() },
+                        added = (o["added"] ?: o["last_modified"])?.toLongOrNull() ?: 0L,
+                        categoryId = o["category_id"] ?: "",
+                        ext = o["container_extension"] ?: "mp4",
+                        section = sec
+                    )
+                }.distinctBy { it.id }   // algunos paneles repiten ids y eso rompía las listas
+            } catch (e: Exception) {
+                f.delete()
+                error("El servidor no devolvió datos válidos (revisa la URL)")
             }
         }
     }
@@ -196,7 +263,7 @@ class XtreamApi(
                 )
             }
         }
-        return out.sortedWith(compareBy({ it.season }, { it.num }))
+        return out.distinctBy { it.id }.sortedWith(compareBy({ it.season }, { it.num }))
     }
 
     override fun playUrl(item: Item): String = when (item.section) {
@@ -216,7 +283,7 @@ class XtreamApi(
 
 /* ---------- Lista M3U / M3U8 ---------- */
 
-class M3uSource(private val url: String, private val cacheDir: File?) : IptvSource {
+class M3uSource(private val url: String, private val cacheDir: File) : IptvSource {
 
     private class Parsed(
         val items: Map<Section, List<Item>>,
@@ -233,8 +300,8 @@ class M3uSource(private val url: String, private val cacheDir: File?) : IptvSour
     private suspend fun ensure(force: Boolean): Parsed {
         val p = parsed
         if (p != null && !force) return p
-        val text = cachedText(cacheDir, url, force)
-        val np = withContext(Dispatchers.Default) { parse(text) }
+        val f = cachedFile(cacheDir, url, force)
+        val np = withContext(Dispatchers.Default) { f.useLines { parse(it) } }
         parsed = np
         return np
     }
@@ -255,7 +322,7 @@ class M3uSource(private val url: String, private val cacheDir: File?) : IptvSour
 
     override fun playUrl(item: Item): String = item.url
 
-    private fun parse(text: String): Parsed {
+    private fun parse(lines: Sequence<String>): Parsed {
         val items = Section.values().associateWith { mutableListOf<Item>() }
         val cats = Section.values().associateWith { linkedSetOf<String>() }
         val seriesMap = linkedMapOf<String, Item>()
@@ -267,7 +334,7 @@ class M3uSource(private val url: String, private val cacheDir: File?) : IptvSour
         var group = "Sin categoría"
         var idx = 0L
 
-        for (raw in text.lineSequence()) {
+        for (raw in lines) {
             val line = raw.trim()
             if (line.startsWith("#EXTINF")) {
                 val attrs = attr.findAll(line).associate { it.groupValues[1].lowercase() to it.groupValues[2] }

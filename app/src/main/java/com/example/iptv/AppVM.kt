@@ -2,6 +2,8 @@ package com.example.iptv
 
 import android.app.Application
 import android.content.Context
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.runtime.*
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -87,6 +89,10 @@ class AppVM(app: Application) : AndroidViewModel(app) {
     var cats by mutableStateOf<List<Category>>(emptyList())
     var favs by mutableStateOf(prefs.favorites())
 
+    // El scroll se guarda aquí para no perder el lugar al volver del reproductor
+    val rowsState = LazyListState()
+    val gridState = LazyGridState()
+
     var playing by mutableStateOf<PlayRequest?>(null)
     var epgNow by mutableStateOf<String?>(null)
     var openSeries by mutableStateOf<Item?>(null)
@@ -110,9 +116,28 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         prefs.save(saved)
     }
 
-        fun changeSort(m: SortMode) {
+    fun changeSort(m: SortMode) {
         sort = m
         prefs.saveSort(m)
+        resetScroll()
+    }
+
+    private fun resetScroll(rows: Boolean = true) {
+        viewModelScope.launch {
+            if (rows) runCatching { rowsState.scrollToItem(0) }
+            runCatching { gridState.scrollToItem(0) }
+        }
+    }
+
+    /** Abre una categoría completa (o los favoritos) en cuadrícula. */
+    fun openCategory(id: String) {
+        category = id
+        resetScroll(rows = false)
+    }
+
+    fun closeCategory() {
+        category = null
+        query = ""
     }
 
     /* ----- favoritos ----- */
@@ -178,6 +203,7 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         category = null
         query = ""
         error = null
+        resetScroll()
         viewModelScope.launch { load(sec) }
     }
 
@@ -208,6 +234,8 @@ class AppVM(app: Application) : AndroidViewModel(app) {
                 items = i
                 cats = cs
             }
+        } catch (e: OutOfMemoryError) {
+            error = "La lista es demasiado grande para la memoria de este dispositivo"
         } catch (e: Exception) {
             error = e.message ?: "Error al cargar la lista"
         }
