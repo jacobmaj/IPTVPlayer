@@ -13,6 +13,9 @@ import java.io.InputStreamReader
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 enum class Section(val label: String) { LIVE("Live"), MOVIES("Películas"), SERIES("Series") }
@@ -27,7 +30,8 @@ data class Settings(
     val user: String = "",
     val pass: String = "",
     val m3uUrl: String = "",
-    val mode: DeviceMode = DeviceMode.AUTO
+    val mode: DeviceMode = DeviceMode.AUTO,
+    val name: String = ""
 )
 
 data class Item(
@@ -45,12 +49,34 @@ data class Category(val id: String, val name: String)
 
 data class Episode(val id: String, val title: String, val season: Int, val num: Int, val url: String)
 
+/** Datos de la cuenta (solo disponibles con acceso por usuario y contraseña). */
+data class AccountInfo(
+    val user: String,
+    val status: String,
+    val expires: Long?,          // epoch en segundos; null = sin vencimiento
+    val maxConnections: String,
+    val activeConnections: String
+)
+
+/** Ficha de una película o serie. */
+data class Detail(
+    val plot: String = "",
+    val genre: String = "",
+    val year: String = "",
+    val rating: String = "",
+    val duration: String = "",
+    val cast: String = "",
+    val director: String = "",
+    val image: String? = null
+)
+
 interface IptvSource {
-    suspend fun login()
+    suspend fun login(): AccountInfo?
     suspend fun items(sec: Section, force: Boolean = false): List<Item>
     suspend fun categories(sec: Section, force: Boolean = false): List<Category>
+    suspend fun detail(item: Item): Detail
     suspend fun episodes(item: Item): List<Episode>
-    fun playUrl(item: Item): String
+    fun playUrl(item: Item, liveExt: String = "m3u8"): String
     suspend fun nowPlaying(item: Item): String? = null
 }
 
@@ -96,11 +122,12 @@ private suspend fun cachedFile(cacheDir: File, url: String, force: Boolean): Fil
     }
 
 /**
- * Lee un arreglo JSON grande en streaming, guardando solo los campos pedidos de cada objeto.
- * Así no se construye todo el árbol JSON en memoria.
+ * Lee un arreglo JSON grande en streaming y construye cada elemento al vuelo.
+ * Reutiliza un solo mapa para todos los objetos: no se guarda nada intermedio en memoria.
  */
-private fun parseArray(file: File, wanted: Set<String>): List<Map<String, String>> {
-    val out = ArrayList<Map<String, String>>()
+private fun <T : Any> parseArray(file: File, wanted: Set<String>, build: (Map<String, String>) -> T?): List<T> {
+    val out = ArrayList<T>()
+    val m = HashMap<String, String>(16)
     JsonReader(InputStreamReader(file.inputStream().buffered(), Charsets.UTF_8)).use { r ->
         r.isLenient = true
         if (r.peek() != JsonToken.BEGIN_ARRAY) return out
@@ -110,7 +137,7 @@ private fun parseArray(file: File, wanted: Set<String>): List<Map<String, String
                 r.skipValue()
                 continue
             }
-            val m = HashMap<String, String>(8)
+            m.clear()
             r.beginObject()
             while (r.hasNext()) {
                 val name = r.nextName()
@@ -122,7 +149,7 @@ private fun parseArray(file: File, wanted: Set<String>): List<Map<String, String
                 }
             }
             r.endObject()
-            out.add(m)
+            build(m)?.let { out.add(it) }
         }
         r.endArray()
     }
@@ -184,10 +211,46 @@ class XtreamApi(
         }
     }
 
-    override suspend fun login() {
+    override suspend fun login(): AccountInfo? {
         val info = (json(api()) as? JsonObject)?.get("user_info") as? JsonObject
             ?: error("Respuesta inválida del servidor")
         if (info.s("auth") != "1") error("Usuario o contraseña incorrectos")
+        return AccountInfo(
+            user = info.s("username") ?: user,
+            status = info.s("status") ?: "",
+            expires = info.s("exp_date")?.toLongOrNull(),
+            maxConnections = info.s("max_connections") ?: "",
+            activeConnections = info.s("active_cons") ?: ""
+        )
+    }
+
+    private var lastSeries: Pair<String, JsonObject>? = null
+
+    // La ficha y los episodios salen de la misma consulta: se guarda para no pedirla dos veces
+    private suspend fun seriesInfo(id: String): JsonObject? {
+        lastSeries?.let { if (it.first == id) return it.second }
+        val o = json(api("get_series_info", "&series_id=$id")) as? JsonObject ?: return null
+        lastSeries = id to o
+        return o
+    }
+
+    override suspend fun detail(item: Item): Detail {
+        val i: JsonObject? = when (item.section) {
+            Section.MOVIES -> (json(api("get_vod_info", "&vod_id=${item.id}")) as? JsonObject)?.get("info") as? JsonObject
+            Section.SERIES -> seriesInfo(item.id)?.get("info") as? JsonObject
+            else -> null
+        }
+        if (i == null) return Detail()
+        return Detail(
+            plot = i.s("plot") ?: i.s("description") ?: "",
+            genre = i.s("genre") ?: "",
+            year = (i.s("releasedate") ?: i.s("release_date") ?: i.s("releaseDate") ?: "").take(4),
+            rating = i.s("rating") ?: "",
+            duration = i.s("duration") ?: i.s("episode_run_time")?.let { "$it min" } ?: "",
+            cast = i.s("cast") ?: i.s("actors") ?: "",
+            director = i.s("director") ?: "",
+            image = i.s("movie_image") ?: i.s("cover_big") ?: i.s("cover")
+        )
     }
 
     override suspend fun categories(sec: Section, force: Boolean): List<Category> {
@@ -199,7 +262,7 @@ class XtreamApi(
         val f = cachedFile(cacheDir, api(action), force)
         return withContext(Dispatchers.Default) {
             try {
-                parseArray(f, CAT_KEYS).map {
+                parseArray(f, CAT_KEYS) {
                     Category(it["category_id"] ?: "", it["category_name"] ?: "Sin nombre")
                 }.distinctBy { it.id }
             } catch (e: Exception) {
@@ -218,17 +281,17 @@ class XtreamApi(
         val f = cachedFile(cacheDir, api(action), force)
         return withContext(Dispatchers.Default) {
             try {
-                parseArray(f, ITEM_KEYS).mapNotNull { o ->
+                parseArray(f, ITEM_KEYS) { o ->
                     val id = (if (sec == Section.SERIES) o["series_id"] else o["stream_id"])
-                        ?: return@mapNotNull null
+                        ?: return@parseArray null
                     Item(
                         id = id,
                         name = o["name"] ?: "Sin nombre",
                         icon = (if (sec == Section.SERIES) o["cover"] else o["stream_icon"])
                             ?.takeIf { it.isNotBlank() },
                         added = (o["added"] ?: o["last_modified"])?.toLongOrNull() ?: 0L,
-                        categoryId = o["category_id"] ?: "",
-                        ext = o["container_extension"] ?: "mp4",
+                        categoryId = (o["category_id"] ?: "").intern(),   // textos repetidos: se comparte una sola copia
+                        ext = (o["container_extension"] ?: "mp4").intern(),
                         section = sec
                     )
                 }.distinctBy { it.id }   // algunos paneles repiten ids y eso rompía las listas
@@ -240,7 +303,7 @@ class XtreamApi(
     }
 
     override suspend fun episodes(item: Item): List<Episode> {
-        val o = json(api("get_series_info", "&series_id=${item.id}")) as? JsonObject ?: return emptyList()
+        val o = seriesInfo(item.id) ?: return emptyList()
         val eps = o["episodes"]
         // Según el servidor, "episodes" viene como objeto {"1":[...]} o como arreglo de arreglos
         val groups: List<JsonElement> = when (eps) {
@@ -266,18 +329,25 @@ class XtreamApi(
         return out.distinctBy { it.id }.sortedWith(compareBy({ it.season }, { it.num }))
     }
 
-    override fun playUrl(item: Item): String = when (item.section) {
-        Section.LIVE -> "$base/live/$user/$pass/${item.id}.m3u8"
+    override fun playUrl(item: Item, liveExt: String): String = when (item.section) {
+        Section.LIVE -> "$base/live/$user/$pass/${item.id}.$liveExt"
         else -> "$base/movie/$user/$pass/${item.id}.${item.ext}"
     }
 
-    /** Programa que se está emitiendo (guía EPG), si el proveedor la incluye. */
+    /** Guía: programa actual y los siguientes (si el proveedor la incluye). */
     override suspend fun nowPlaying(item: Item): String? {
         if (item.section != Section.LIVE) return null
-        val o = json(api("get_short_epg", "&stream_id=${item.id}&limit=1")) as? JsonObject ?: return null
-        val first = (o["epg_listings"] as? JsonArray)?.firstOrNull() as? JsonObject ?: return null
-        val raw = first.s("title") ?: return null
-        return runCatching { String(Base64.decode(raw, Base64.DEFAULT), Charsets.UTF_8) }.getOrDefault(raw)
+        val o = json(api("get_short_epg", "&stream_id=${item.id}&limit=3")) as? JsonObject ?: return null
+        val list = o["epg_listings"] as? JsonArray ?: return null
+        val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+        val lines = list.mapNotNull { el ->
+            val e = el as? JsonObject ?: return@mapNotNull null
+            val raw = e.s("title") ?: return@mapNotNull null
+            val title = runCatching { String(Base64.decode(raw, Base64.DEFAULT), Charsets.UTF_8) }.getOrDefault(raw)
+            val ts = e.s("start_timestamp")?.toLongOrNull()
+            if (ts != null) "${fmt.format(Date(ts * 1000))}  $title" else title
+        }
+        return lines.joinToString("\n").ifBlank { null }
     }
 }
 
@@ -306,10 +376,13 @@ class M3uSource(private val url: String, private val cacheDir: File) : IptvSourc
         return np
     }
 
-    override suspend fun login() {
+    override suspend fun login(): AccountInfo? {
         val p = ensure(false)
         if (p.items.values.all { it.isEmpty() }) error("La lista M3U no contiene canales")
+        return null
     }
+
+    override suspend fun detail(item: Item): Detail = Detail()
 
     override suspend fun items(sec: Section, force: Boolean): List<Item> = ensure(force).items[sec] ?: emptyList()
 
@@ -320,7 +393,7 @@ class M3uSource(private val url: String, private val cacheDir: File) : IptvSourc
     override suspend fun episodes(item: Item): List<Episode> =
         (ensure(false).episodes[item.id] ?: emptyList()).sortedWith(compareBy({ it.season }, { it.num }))
 
-    override fun playUrl(item: Item): String = item.url
+    override fun playUrl(item: Item, liveExt: String): String = item.url
 
     private fun parse(lines: Sequence<String>): Parsed {
         val items = Section.values().associateWith { mutableListOf<Item>() }

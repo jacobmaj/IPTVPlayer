@@ -6,20 +6,13 @@ import android.content.res.Configuration
 import android.os.Bundle
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -29,6 +22,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
@@ -36,18 +31,15 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import coil.compose.AsyncImage
 
 class MainActivity : ComponentActivity() {
     private val vm: AppVM by viewModels()
@@ -111,8 +103,10 @@ fun App(vm: AppVM) {
         p != null -> androidx.compose.runtime.key(p.url) {
             PlayerScreen(p, vm.epgNow, { vm.onEnded() }) { vm.playing = null }
         }
-        vm.openSeries != null -> SeriesScreen(vm)
+        vm.detailItem != null -> DetailScreen(vm)
         !vm.loggedIn -> LoginScreen(vm)
+        !vm.inSection -> DashboardScreen(vm, isTv)
+        vm.section == Section.LIVE && isTv -> LiveScreen(vm)
         else -> HomeScreen(vm, isTv)
     }
 
@@ -164,16 +158,18 @@ fun FocusBox(
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
+    focusRequester: FocusRequester? = null,
     content: @Composable BoxScope.() -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(10.dp)
     Box(
         modifier
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .onFocusChanged { focused = it.isFocused }
             .then(if (focused) Modifier.border(3.dp, Color(0xFF4FC3F7), shape) else Modifier)
             .clip(shape)
-            // Tecla MENÚ del control remoto = acción larga (favorito)
+            // Tecla MENÚ del control remoto = acción larga (favorito, borrar…)
             .onKeyEvent { e ->
                 if (onLongClick != null && e.key == Key.Menu && e.type == KeyEventType.KeyUp) {
                     onLongClick()
@@ -188,8 +184,14 @@ fun FocusBox(
 }
 
 @Composable
-fun Chip(text: String, selected: Boolean = false, onClick: () -> Unit) {
-    FocusBox(onClick = onClick) {
+fun Chip(
+    text: String,
+    selected: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
+    focusRequester: FocusRequester? = null,
+    onClick: () -> Unit
+) {
+    FocusBox(onClick = onClick, onLongClick = onLongClick, focusRequester = focusRequester) {
         Text(
             text,
             color = Color.White,
@@ -201,8 +203,9 @@ fun Chip(text: String, selected: Boolean = false, onClick: () -> Unit) {
     }
 }
 
-/* ---------- Login ---------- */
+/* ---------- Inicio de sesión y usuarios guardados ---------- */
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun LoginScreen(vm: AppVM) {
     var type by remember { mutableStateOf(vm.saved.type) }
@@ -210,18 +213,37 @@ fun LoginScreen(vm: AppVM) {
     var user by remember { mutableStateOf(vm.saved.user) }
     var pass by remember { mutableStateOf(vm.saved.pass) }
     var m3u by remember { mutableStateOf(vm.saved.m3uUrl) }
+    var name by remember { mutableStateOf("") }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             Modifier
-                .widthIn(max = 520.dp)
+                .widthIn(max = 560.dp)
                 .verticalScroll(rememberScrollState())
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("IPTV Player", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
 
-            Text("Tipo de acceso", color = Color.LightGray)
+            if (vm.profiles.isNotEmpty()) {
+                Text("Usuarios guardados", color = Color.LightGray)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    vm.profiles.forEach { p ->
+                        Chip(profileLabel(p), onLongClick = { vm.deleteProfile(p) }) {
+                            vm.login(p.copy(mode = vm.saved.mode))
+                        }
+                    }
+                }
+                Text(
+                    "Pulsa para entrar. Mantén pulsado (o MENÚ) para borrar un usuario.",
+                    color = Color.Gray, fontSize = 11.sp
+                )
+            }
+
+            Text("Agregar usuario", color = Color.LightGray)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SourceType.values().forEach { t -> Chip(t.label, type == t) { type = t } }
             }
@@ -244,303 +266,34 @@ fun LoginScreen(vm: AppVM) {
                     label = { Text("Contraseña") },
                     singleLine = true, modifier = Modifier.fillMaxWidth(),
                     visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done)
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Next)
                 )
             } else {
                 OutlinedTextField(
                     value = m3u, onValueChange = { m3u = it },
                     label = { Text("URL de la lista M3U / M3U8") },
                     singleLine = true, modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done)
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next)
                 )
             }
+            OutlinedTextField(
+                value = name, onValueChange = { name = it },
+                label = { Text("Nombre del usuario (opcional)") },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done)
+            )
 
             Text("¿Dónde lo vas a ver?", color = Color.LightGray)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DeviceMode.values().forEach { m -> Chip(m.label, vm.saved.mode == m) { vm.setMode(m) } }
             }
 
-            Chip("Conectar") { vm.login(Settings(type, server, user, pass, m3u, vm.saved.mode)) }
+            Chip("Conectar") {
+                vm.login(Settings(type, server, user, pass, m3u, vm.saved.mode, name.trim()))
+            }
 
             if (vm.busy) CircularProgressIndicator()
             vm.error?.let { Text(it, color = Color(0xFFFF8A80)) }
-        }
-    }
-}
-
-/* ---------- Home: filas por categoría (estilo catálogo) ---------- */
-
-private class CatRow(val id: String, val name: String, val items: List<Item>)
-
-private fun sortItems(list: List<Item>, mode: SortMode): List<Item> {
-    val byName = compareBy<Item, String>(String.CASE_INSENSITIVE_ORDER) { it.name }
-    return when (mode) {
-        SortMode.NAME_ASC -> list.sortedWith(byName)
-        SortMode.NAME_DESC -> list.sortedWith(byName).reversed()
-        SortMode.DATE_DESC -> list.sortedByDescending { it.added }
-        SortMode.DATE_ASC -> list.sortedBy { it.added }
-    }
-}
-
-private fun cardWidth(item: Item, isTv: Boolean) = when {
-    item.section == Section.LIVE -> if (isTv) 150.dp else 120.dp
-    else -> if (isTv) 116.dp else 96.dp
-}
-
-@Composable
-fun HomeScreen(vm: AppVM, isTv: Boolean) {
-    var showMenu by remember { mutableStateOf(false) }
-    val searching = vm.query.isNotBlank()
-    val inCategory = vm.category != null
-
-    // Atrás: sale de la categoría o de la búsqueda
-    BackHandler(enabled = searching || inCategory) { vm.closeCategory() }
-
-    val sorted = remember(vm.items, vm.sort) { sortItems(vm.items, vm.sort) }
-
-    // Lista plana: categoría abierta, favoritos o resultados de búsqueda
-    val flat = remember(sorted, vm.category, vm.query, vm.favs) {
-        val cat = vm.category
-        if (cat == null && vm.query.isBlank()) {
-            emptyList()
-        } else {
-            sorted.filter {
-                val okCat = when (cat) {
-                    null -> true
-                    FAV -> vm.isFav(it)
-                    else -> it.categoryId == cat
-                }
-                okCat && (vm.query.isBlank() || it.name.contains(vm.query, ignoreCase = true))
-            }
-        }
-    }
-
-    // Filas: una por categoría, con favoritos primero si hay
-    val rows = remember(sorted, vm.cats, vm.favs) {
-        val byCat = sorted.groupBy { it.categoryId }
-        val out = mutableListOf<CatRow>()
-        val favItems = sorted.filter { vm.isFav(it) }
-        if (favItems.isNotEmpty()) out.add(CatRow(FAV, "★ Favoritos", favItems))
-        vm.cats.distinctBy { it.id }.forEach { c ->
-            byCat[c.id]?.let { out.add(CatRow(c.id, c.name, it)) }
-        }
-        out
-    }
-
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = if (isTv) 24.dp else 10.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        val title = when {
-            searching -> "Resultados: ${vm.query}"
-            vm.category == FAV -> "★ Favoritos"
-            inCategory -> vm.cats.firstOrNull { it.id == vm.category }?.name ?: ""
-            else -> vm.section.label
-        }
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            if (searching || inCategory) Chip("← Volver") { vm.closeCategory() }
-            Text(
-                title, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
-            )
-            Chip("☰ Menú") { showMenu = true }   // un solo botón con todas las opciones
-        }
-
-        if (vm.busy) CircularProgressIndicator()
-        vm.error?.let { Text(it, color = Color(0xFFFF8A80)) }
-
-        if (searching || inCategory) {
-            if (flat.isEmpty() && !vm.busy) Text("No hay elementos para mostrar", color = Color.Gray)
-            val minW = if (vm.section == Section.LIVE) (if (isTv) 150.dp else 120.dp) else (if (isTv) 116.dp else 96.dp)
-            LazyVerticalGrid(
-                state = vm.gridState,
-                columns = GridCells.Adaptive(minW),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.weight(1f).fillMaxWidth()
-            ) {
-                items(flat, key = { it.id }) { item ->
-                    SmallCard(
-                        item, Modifier.fillMaxWidth(), vm.isFav(item),
-                        { vm.open(item, flat) }, { vm.toggleFav(item) }
-                    )
-                }
-            }
-        } else {
-            if (rows.isEmpty() && !vm.busy && vm.error == null) {
-                Text("No hay elementos para mostrar", color = Color.Gray)
-            }
-            RowsView(vm, rows, isTv, Modifier.weight(1f))
-        }
-    }
-
-    if (showMenu) MenuDialog(vm, isTv) { showMenu = false }
-}
-
-@Composable
-private fun RowsView(vm: AppVM, rows: List<CatRow>, isTv: Boolean, modifier: Modifier) {
-    LazyColumn(
-        state = vm.rowsState,
-        modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        items(rows, key = { it.id }) { r ->
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                // Entrar a la categoría completa
-                FocusBox(onClick = { vm.openCategory(r.id) }) {
-                    Text(
-                        "${r.name}   ›   ${r.items.size}",
-                        color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                    )
-                }
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
-                ) {
-                    items(r.items.take(40), key = { it.id }) { item ->
-                        SmallCard(
-                            item, Modifier.width(cardWidth(item, isTv)), vm.isFav(item),
-                            { vm.open(item, r.items) }, { vm.toggleFav(item) }
-                        )
-                    }
-                    if (r.items.size > 40) {
-                        item {
-                            Box(Modifier.width(90.dp).height(120.dp), contentAlignment = Alignment.Center) {
-                                Chip("Ver todo ›") { vm.openCategory(r.id) }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun SmallCard(item: Item, modifier: Modifier, fav: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
-    val live = item.section == Section.LIVE
-    FocusBox(modifier, onClick, onLongClick) {
-        Column(
-            Modifier.fillMaxWidth().background(Color(0xFF1A212B)).padding(4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            AsyncImage(
-                model = item.icon,
-                contentDescription = null,
-                contentScale = if (live) ContentScale.Fit else ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(if (live) 1.5f else 0.67f)
-                    .clip(RoundedCornerShape(5.dp))
-                    .background(Color(0xFF11161D))
-            )
-            Text(
-                item.name, color = Color.White, fontSize = 11.sp, lineHeight = 13.sp,
-                maxLines = 2, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 3.dp).fillMaxWidth().height(28.dp)
-            )
-        }
-        if (fav) {
-            Text(
-                "★", color = Color(0xFFFFC107), fontSize = 16.sp,
-                modifier = Modifier.align(Alignment.TopEnd).padding(6.dp)
-            )
-        }
-    }
-}
-
-/* ---------- Menú único (botón arriba a la derecha) ---------- */
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun MenuDialog(vm: AppVM, isTv: Boolean, onClose: () -> Unit) {
-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = Color(0xFF161B22),
-            modifier = Modifier.fillMaxWidth(if (isTv) 0.6f else 0.94f)
-        ) {
-            Column(
-                Modifier.verticalScroll(rememberScrollState()).padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text("Apartado", color = Color.LightGray)
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Section.values().forEach { s ->
-                        Chip(s.label, vm.section == s) { vm.select(s); onClose() }
-                    }
-                }
-
-                Text("Ordenar por", color = Color.LightGray)
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SortMode.values().forEach { m ->
-                        Chip(m.label, vm.sort == m) { vm.changeSort(m); onClose() }
-                    }
-                }
-
-                Text("Buscar", color = Color.LightGray)
-                OutlinedTextField(
-                    value = vm.query, onValueChange = { vm.query = it },
-                    placeholder = { Text("Nombre de película, serie o canal…") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth()
-                )
-
-                Text("Más opciones", color = Color.LightGray)
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Chip("★ Favoritos") { vm.openCategory(FAV); onClose() }
-                    Chip("Actualizar lista") { vm.refresh(); onClose() }
-                    Chip("Cerrar sesión") { vm.logout(); onClose() }
-                    Chip("Cerrar menú") { onClose() }
-                }
-
-                Text(
-                    if (isTv) "Para marcar un favorito: mantén pulsado OK o pulsa MENÚ sobre el elemento"
-                    else "Para marcar un favorito: mantén pulsado el elemento",
-                    color = Color.Gray, fontSize = 11.sp
-                )
-            }
-        }
-    }
-}
-
-/* ---------- Episodios de una serie ---------- */
-
-@Composable
-fun SeriesScreen(vm: AppVM) {
-    BackHandler { vm.openSeries = null }
-    val s = vm.openSeries ?: return
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(s.name, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-        Chip("← Volver") { vm.openSeries = null }
-        if (vm.episodes.isEmpty() && vm.error == null) CircularProgressIndicator()
-        vm.error?.let { Text(it, color = Color(0xFFFF8A80)) }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(vm.episodes, key = { it.id }) { e ->
-                FocusBox(Modifier.fillMaxWidth(), { vm.playEpisode(e) }) {
-                    Text(
-                        "T${e.season} · E${e.num}   ${e.title}",
-                        color = Color.White,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF1A212B))
-                            .padding(14.dp)
-                    )
-                }
-            }
         }
     }
 }
