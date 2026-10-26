@@ -12,19 +12,25 @@ import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -83,7 +89,7 @@ fun applyBestDisplayMode(act: Activity) {
 
 /* ---------- Construcción del reproductor (compartida por pantalla completa y vista previa) ---------- */
 
-private fun isSoftwareCodec(name: String): Boolean {
+fun isSoftwareCodec(name: String): Boolean {
     val n = name.lowercase()
     return n.startsWith("omx.google.") || n.startsWith("c2.android.") ||
         n.startsWith("omx.ffmpeg.") || n.contains(".sw.") || n.endsWith(".sw")
@@ -133,29 +139,48 @@ fun buildPlayer(ctx: Context, opts: PlayerOpts, preview: Boolean): ExoPlayer {
         .setDataSourceFactory(http)
         .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(8))
 
-    return ExoPlayer.Builder(ctx, renderers)
+    val player = ExoPlayer.Builder(ctx, renderers)
         .setTrackSelector(selector)
         .setLoadControl(loadControl)
         .setMediaSourceFactory(sources)
+        .setSeekBackIncrementMs(10_000)                       // adelantar / retroceder 10 s
+        .setSeekForwardIncrementMs(10_000)
         .build()
+
+    // Ajuste automático de fotogramas: la TV cambia a 24/25/30/60 Hz según el video (si el cambio es suave)
+    player.setVideoChangeFrameRateStrategy(
+        if (opts.frameRate && !preview) C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_ONLY_IF_SEAMLESS
+        else C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF
+    )
+    return player
 }
 
 /* ---------- Pantalla completa ---------- */
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun PlayerScreen(req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: () -> Unit) {
+fun PlayerScreen(vm: AppVM, req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val act = ctx as? Activity
     val prefs = remember { Prefs(ctx) }
     val opts = remember { prefs.loadOpts() }
-    val info = remember { bestDisplayInfo(ctx) }
-    var res by remember { mutableStateOf("") }
     var err by remember { mutableStateOf<String?>(null) }
     var showInfo by remember { mutableStateOf(true) }
+    var aspect by remember { mutableStateOf(0) }
+    val aspectModes = remember {
+        intArrayOf(
+            AspectRatioFrameLayout.RESIZE_MODE_FIT,
+            AspectRatioFrameLayout.RESIZE_MODE_ZOOM,
+            AspectRatioFrameLayout.RESIZE_MODE_FILL
+        )
+    }
+    val aspectNames = listOf("Ajustar", "Ampliar", "Estirar")
+    val panelFocus = remember { FocusRequester() }
+    val holder = remember { mutableListOf<PlayerView>() }
     val currentOnEnded by rememberUpdatedState(onEnded)
 
     BackHandler(onBack = onBack)
+    BackHandler(enabled = vm.panel) { vm.panel = false }   // Atrás cierra primero el panel de opciones
 
     // Pantalla completa y horizontal mientras se reproduce
     DisposableEffect(Unit) {
@@ -204,6 +229,16 @@ fun PlayerScreen(req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: ()
         showInfo = false
     }
 
+    // El foco pasa al panel cuando se abre y vuelve al video cuando se cierra
+    LaunchedEffect(vm.panel) {
+        delay(150)
+        if (vm.panel) {
+            runCatching { panelFocus.requestFocus() }
+        } else {
+            holder.firstOrNull()?.requestFocus()
+        }
+    }
+
     DisposableEffect(exo) {
         val handler = Handler(Looper.getMainLooper())
         var triedAlt = false
@@ -215,13 +250,6 @@ fun PlayerScreen(req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: ()
             else -> null
         }
         val listener = object : Player.Listener {
-            override fun onVideoSizeChanged(videoSize: VideoSize) {
-                if (videoSize.width > 0) {
-                    val tag = if (videoSize.width >= 3800) " · 4K" else ""
-                    res = "${videoSize.width}×${videoSize.height}$tag"
-                }
-            }
-
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED && !req.live) currentOnEnded()
             }
@@ -265,14 +293,16 @@ fun PlayerScreen(req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: ()
                 PlayerView(c).apply {
                     player = exo
                     useController = true
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     keepScreenOn = true
                     isFocusable = true
                     isFocusableInTouchMode = true
+                    holder.add(this)
                     post { requestFocus() }   // el control remoto (D-pad / teclas multimedia) actúa sobre el reproductor
                 }
-            }
+            },
+            update = { it.resizeMode = aspectModes[aspect] }
         )
+
         if (showInfo) {
             Column(
                 Modifier
@@ -285,18 +315,17 @@ fun PlayerScreen(req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: ()
                 if (req.live && epg != null) {
                     Text(epg, color = Color.LightGray, fontSize = 13.sp)
                 }
+                Text("MENÚ o GUÍA: opciones", color = Color.Gray, fontSize = 11.sp)
             }
         }
-        if (res.isNotEmpty()) {
+        if (vm.numberBuf.isNotEmpty()) {
             Text(
-                text = res + if (info.is4k) " · pantalla 4K" else "",
-                color = Color.White,
-                fontSize = 12.sp,
+                vm.numberBuf, color = Color.White, fontSize = 48.sp, fontWeight = FontWeight.Bold,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .padding(12.dp)
-                    .background(Color(0x99000000))
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                    .padding(top = 16.dp, end = 24.dp)
+                    .background(Color(0xAA000000))
+                    .padding(horizontal = 16.dp, vertical = 6.dp)
             )
         }
         err?.let {
@@ -309,6 +338,53 @@ fun PlayerScreen(req: PlayRequest, epg: String?, onEnded: () -> Unit, onBack: ()
                     .background(Color(0xCC000000))
                     .padding(16.dp)
             )
+        }
+
+        // Panel de opciones (tecla MENÚ o GUÍA): aspecto de la imagen y lista de canales
+        if (vm.panel) {
+            val chans = vm.zapChannels
+            val startIdx = remember { chans.indexOfFirst { it.id == vm.nowId }.coerceAtLeast(0) }
+            val listState = rememberLazyListState(initialFirstVisibleItemIndex = max(0, startIdx - 2))
+            Column(
+                Modifier
+                    .align(Alignment.CenterEnd)
+                    .width(340.dp)
+                    .fillMaxHeight()
+                    .background(Color(0xE60B0B0B))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text("Opciones", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Chip("Aspecto: ${aspectNames[aspect]}", focusRequester = panelFocus) {
+                    aspect = (aspect + 1) % aspectModes.size
+                }
+                if (req.live) {
+                    Chip("Canal anterior") { vm.previousChannel() }
+                    if (chans.isNotEmpty()) {
+                        Text("Canales (también puedes teclear su número)", color = Color.LightGray, fontSize = 12.sp)
+                        LazyColumn(
+                            Modifier.weight(1f).fillMaxWidth(),
+                            state = listState,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            items(chans, key = { it.id }) { ch ->
+                                val idx = chans.indexOf(ch) + 1
+                                FocusBox(Modifier.fillMaxWidth(), { vm.zapTo(ch) }) {
+                                    Text(
+                                        "$idx   ${ch.name}", color = Color.White, fontSize = 13.sp,
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(if (ch.id == vm.nowId) Color(0xFFE50914) else Color(0xFF2B2B2B))
+                                            .padding(8.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                Chip("Cerrar") { vm.panel = false }
+            }
         }
     }
 }

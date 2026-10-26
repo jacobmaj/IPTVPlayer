@@ -8,6 +8,7 @@ import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
@@ -26,6 +27,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -37,6 +39,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -57,22 +60,40 @@ class MainActivity : ComponentActivity() {
         applyBestDisplayMode(this)   // pide la mayor resolución de la pantalla (4K si existe)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(Modifier.fillMaxSize(), color = Color(0xFF0E1116)) { App(vm) }
+                Surface(Modifier.fillMaxSize(), color = Color(0xFF0B0B0B)) { App(vm) }
             }
         }
     }
 
-    // CH+ / CH- (o RePág / AvPág) cambian de canal mientras se ve Live
+    // Teclas del control remoto mientras se reproduce
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 && vm.playing?.live == true) {
+        val p = vm.playing
+        if (p != null && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_PAGE_UP -> {
-                    vm.zap(1)
+                // MENÚ o GUÍA: panel de opciones sobre el video
+                KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_GUIDE -> {
+                    vm.panel = !vm.panel
                     return true
                 }
-                KeyEvent.KEYCODE_CHANNEL_DOWN, KeyEvent.KEYCODE_PAGE_DOWN -> {
-                    vm.zap(-1)
-                    return true
+            }
+            if (p.live && !vm.panel) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_PAGE_UP -> {
+                        vm.zap(1)
+                        return true
+                    }
+                    KeyEvent.KEYCODE_CHANNEL_DOWN, KeyEvent.KEYCODE_PAGE_DOWN -> {
+                        vm.zap(-1)
+                        return true
+                    }
+                    KeyEvent.KEYCODE_LAST_CHANNEL -> {
+                        vm.previousChannel()
+                        return true
+                    }
+                    in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
+                        vm.typeDigit(event.keyCode - KeyEvent.KEYCODE_0)
+                        return true
+                    }
                 }
             }
         }
@@ -101,10 +122,11 @@ fun App(vm: AppVM) {
     val p = vm.playing
     when {
         p != null -> androidx.compose.runtime.key(p.url) {
-            PlayerScreen(p, vm.epgNow, { vm.onEnded() }) { vm.playing = null }
+            PlayerScreen(vm, p, vm.epgNow, { vm.onEnded() }) { vm.playing = null }
         }
         vm.detailItem != null -> DetailScreen(vm)
         !vm.loggedIn -> LoginScreen(vm)
+        vm.searchOpen -> SearchScreen(vm)
         !vm.inSection -> DashboardScreen(vm, isTv)
         vm.section == Section.LIVE && isTv -> LiveScreen(vm)
         else -> HomeScreen(vm, isTv)
@@ -159,15 +181,23 @@ fun FocusBox(
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
     focusRequester: FocusRequester? = null,
+    scaleOnFocus: Boolean = false,
     content: @Composable BoxScope.() -> Unit
 ) {
     var focused by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(10.dp)
+    // Al enfocar una carátula crece un poco, como en las plataformas de streaming
+    val scale by animateFloatAsState(if (focused && scaleOnFocus) 1.07f else 1f, label = "focusScale")
     Box(
         modifier
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .onFocusChanged { focused = it.isFocused }
-            .then(if (focused) Modifier.border(3.dp, Color(0xFF4FC3F7), shape) else Modifier)
+            .zIndex(if (focused) 1f else 0f)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .then(if (focused) Modifier.border(3.dp, Color(0xFFFFFFFF), shape) else Modifier)
             .clip(shape)
             // Tecla MENÚ del control remoto = acción larga (favorito, borrar…)
             .onKeyEvent { e ->
@@ -197,7 +227,7 @@ fun Chip(
             color = Color.White,
             fontSize = 15.sp,
             modifier = Modifier
-                .background(if (selected) Color(0xFF1E88E5) else Color(0xFF232A35))
+                .background(if (selected) Color(0xFFE50914) else Color(0xFF2B2B2B))
                 .padding(horizontal = 16.dp, vertical = 10.dp)
         )
     }
@@ -214,6 +244,7 @@ fun LoginScreen(vm: AppVM) {
     var pass by remember { mutableStateOf(vm.saved.pass) }
     var m3u by remember { mutableStateOf(vm.saved.m3uUrl) }
     var name by remember { mutableStateOf("") }
+    var showQr by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
@@ -223,7 +254,7 @@ fun LoginScreen(vm: AppVM) {
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("IPTV Player", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            Text("IPTV Player", color = Nf.red, fontSize = 28.sp, fontWeight = FontWeight.Black)
 
             if (vm.profiles.isNotEmpty()) {
                 Text("Usuarios guardados", color = Color.LightGray)
@@ -244,6 +275,8 @@ fun LoginScreen(vm: AppVM) {
             }
 
             Text("Agregar usuario", color = Color.LightGray)
+            Chip("Entrar con el celular (código QR)") { showQr = true }
+
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SourceType.values().forEach { t -> Chip(t.label, type == t) { type = t } }
             }
@@ -296,4 +329,6 @@ fun LoginScreen(vm: AppVM) {
             vm.error?.let { Text(it, color = Color(0xFFFF8A80)) }
         }
     }
+
+    if (showQr) QrLoginDialog(vm) { showQr = false }
 }

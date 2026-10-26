@@ -47,7 +47,16 @@ data class Item(
 
 data class Category(val id: String, val name: String)
 
-data class Episode(val id: String, val title: String, val season: Int, val num: Int, val url: String)
+data class Episode(
+    val id: String,
+    val title: String,
+    val season: Int,
+    val num: Int,
+    val url: String,
+    val image: String? = null,
+    val plot: String = "",
+    val duration: String = ""
+)
 
 /** Datos de la cuenta (solo disponibles con acceso por usuario y contraseña). */
 data class AccountInfo(
@@ -78,6 +87,9 @@ interface IptvSource {
     suspend fun episodes(item: Item): List<Episode>
     fun playUrl(item: Item, liveExt: String = "m3u8"): String
     suspend fun nowPlaying(item: Item): String? = null
+    suspend fun schedule(item: Item): List<String> = emptyList()
+    suspend fun search(query: String, hideAdult: Boolean): List<Item>
+    suspend fun prefetch() {}
 }
 
 /* ---------- Utilidades de red y caché en disco ---------- */
@@ -89,7 +101,8 @@ private val http: OkHttpClient by lazy {
         .build()
 }
 
-private const val CACHE_TTL_MS = 6L * 60 * 60 * 1000   // las listas se reutilizan 6 horas
+// Las listas se reutilizan 20 horas (cada madrugada se renuevan solas)
+private const val CACHE_TTL_MS = 20L * 60 * 60 * 1000
 
 /** Descarga corta (respuestas pequeñas: login, episodios, guía). */
 private fun download(url: String): String =
@@ -100,7 +113,7 @@ private fun download(url: String): String =
 
 /**
  * Descarga listas grandes directo a un archivo, sin cargarlas completas en memoria
- * (las listas de series pueden pesar decenas de MB y cerraban la app por falta de memoria).
+ * (las listas de series pueden pesar decenas de MB).
  */
 private suspend fun cachedFile(cacheDir: File, url: String, force: Boolean): File =
     withContext(Dispatchers.IO) {
@@ -164,6 +177,21 @@ private val CAT_KEYS = setOf("category_id", "category_name")
 
 private fun JsonObject.s(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
+private fun b64(raw: String): String =
+    runCatching { String(Base64.decode(raw, Base64.DEFAULT), Charsets.UTF_8) }.getOrDefault(raw)
+
+/** Duración legible: acepta segundos ("2580") o texto ("00:43:15"). */
+private fun prettyDuration(secs: String?, text: String?): String {
+    val s = secs?.toLongOrNull() ?: 0L
+    if (s > 0) return "${(s + 30) / 60} min"
+    val parts = text?.split(':')?.mapNotNull { it.trim().toIntOrNull() }
+    if (parts != null && parts.size == 3) {
+        val m = parts[0] * 60 + parts[1]
+        if (m > 0) return "$m min"
+    }
+    return ""
+}
+
 /** Si la URL M3U trae usuario y clave de Xtream (get.php?username=..&password=..) devuelve (servidor, usuario, clave). */
 fun xtreamFromM3u(url: String): Triple<String, String, String>? {
     return try {
@@ -182,6 +210,16 @@ fun xtreamFromM3u(url: String): Triple<String, String, String>? {
     }
 }
 
+/** Última versión publicada en GitHub (etiqueta "v12" → 12) y su enlace. */
+suspend fun fetchLatestRelease(repo: String): Pair<Int, String>? = withContext(Dispatchers.IO) {
+    runCatching {
+        val o = Json.parseToJsonElement(download("https://api.github.com/repos/$repo/releases/latest")) as JsonObject
+        val tag = o.s("tag_name") ?: return@runCatching null
+        val n = tag.filter { it.isDigit() }.toIntOrNull() ?: return@runCatching null
+        n to (o.s("html_url") ?: "")
+    }.getOrNull()
+}
+
 /* ---------- Xtream Codes ---------- */
 
 class XtreamApi(
@@ -198,6 +236,18 @@ class XtreamApi(
     private fun api(action: String? = null, extra: String = ""): String =
         "$base/player_api.php?username=${enc(user)}&password=${enc(pass)}" +
             (if (action != null) "&action=$action" else "") + extra
+
+    private fun itemsAction(sec: Section) = when (sec) {
+        Section.LIVE -> "get_live_streams"
+        Section.MOVIES -> "get_vod_streams"
+        Section.SERIES -> "get_series"
+    }
+
+    private fun catsAction(sec: Section) = when (sec) {
+        Section.LIVE -> "get_live_categories"
+        Section.MOVIES -> "get_vod_categories"
+        Section.SERIES -> "get_series_categories"
+    }
 
     /** Para respuestas pequeñas. */
     private suspend fun json(url: String): JsonElement {
@@ -224,6 +274,77 @@ class XtreamApi(
         )
     }
 
+    override suspend fun categories(sec: Section, force: Boolean): List<Category> {
+        val f = cachedFile(cacheDir, api(catsAction(sec)), force)
+        return withContext(Dispatchers.Default) {
+            try {
+                parseArray(f, CAT_KEYS) {
+                    Category(it["category_id"] ?: "", it["category_name"] ?: "Sin nombre")
+                }.distinctBy { it.id }
+            } catch (e: Exception) {
+                f.delete()
+                error("El servidor no devolvió datos válidos (revisa la URL)")
+            }
+        }
+    }
+
+    private fun toItem(o: Map<String, String>, sec: Section): Item? {
+        val id = (if (sec == Section.SERIES) o["series_id"] else o["stream_id"]) ?: return null
+        return Item(
+            id = id,
+            name = o["name"] ?: "Sin nombre",
+            icon = (if (sec == Section.SERIES) o["cover"] else o["stream_icon"])?.takeIf { it.isNotBlank() },
+            added = (o["added"] ?: o["last_modified"])?.toLongOrNull() ?: 0L,
+            categoryId = (o["category_id"] ?: "").intern(),   // textos repetidos: se comparte una sola copia
+            ext = (o["container_extension"] ?: "mp4").intern(),
+            section = sec
+        )
+    }
+
+    override suspend fun items(sec: Section, force: Boolean): List<Item> {
+        val f = cachedFile(cacheDir, api(itemsAction(sec)), force)
+        return withContext(Dispatchers.Default) {
+            try {
+                parseArray(f, ITEM_KEYS) { toItem(it, sec) }
+                    .distinctBy { it.id }   // algunos paneles repiten ids y eso rompía las listas
+            } catch (e: Exception) {
+                f.delete()
+                error("El servidor no devolvió datos válidos (revisa la URL)")
+            }
+        }
+    }
+
+    /** Busca en los tres apartados leyendo los archivos guardados, sin cargar las listas en memoria. */
+    override suspend fun search(query: String, hideAdult: Boolean): List<Item> {
+        val out = ArrayList<Item>()
+        for (sec in Section.values()) {
+            val adult = if (hideAdult) {
+                categories(sec, false).filter { isAdult(it.name) }.map { it.id }.toSet()
+            } else {
+                emptySet()
+            }
+            val f = cachedFile(cacheDir, api(itemsAction(sec)), false)
+            val found = withContext(Dispatchers.Default) {
+                parseArray(f, ITEM_KEYS) { o ->
+                    val name = o["name"] ?: return@parseArray null
+                    if (!name.contains(query, ignoreCase = true)) return@parseArray null
+                    if ((o["category_id"] ?: "") in adult) return@parseArray null
+                    toItem(o, sec)
+                }.distinctBy { it.id }.take(60)
+            }
+            out.addAll(found)
+        }
+        return out
+    }
+
+    /** Descarga las listas sin analizarlas (para la actualización nocturna). */
+    override suspend fun prefetch() {
+        for (sec in Section.values()) {
+            cachedFile(cacheDir, api(itemsAction(sec)), true)
+            cachedFile(cacheDir, api(catsAction(sec)), true)
+        }
+    }
+
     private var lastSeries: Pair<String, JsonObject>? = null
 
     // La ficha y los episodios salen de la misma consulta: se guarda para no pedirla dos veces
@@ -246,60 +367,12 @@ class XtreamApi(
             genre = i.s("genre") ?: "",
             year = (i.s("releasedate") ?: i.s("release_date") ?: i.s("releaseDate") ?: "").take(4),
             rating = i.s("rating") ?: "",
-            duration = i.s("duration") ?: i.s("episode_run_time")?.let { "$it min" } ?: "",
+            duration = i.s("duration")?.takeIf { it.isNotBlank() && it != "0" }
+                ?: i.s("episode_run_time")?.takeIf { it.isNotBlank() && it != "0" }?.let { "$it min" } ?: "",
             cast = i.s("cast") ?: i.s("actors") ?: "",
             director = i.s("director") ?: "",
             image = i.s("movie_image") ?: i.s("cover_big") ?: i.s("cover")
         )
-    }
-
-    override suspend fun categories(sec: Section, force: Boolean): List<Category> {
-        val action = when (sec) {
-            Section.LIVE -> "get_live_categories"
-            Section.MOVIES -> "get_vod_categories"
-            Section.SERIES -> "get_series_categories"
-        }
-        val f = cachedFile(cacheDir, api(action), force)
-        return withContext(Dispatchers.Default) {
-            try {
-                parseArray(f, CAT_KEYS) {
-                    Category(it["category_id"] ?: "", it["category_name"] ?: "Sin nombre")
-                }.distinctBy { it.id }
-            } catch (e: Exception) {
-                f.delete()
-                error("El servidor no devolvió datos válidos (revisa la URL)")
-            }
-        }
-    }
-
-    override suspend fun items(sec: Section, force: Boolean): List<Item> {
-        val action = when (sec) {
-            Section.LIVE -> "get_live_streams"
-            Section.MOVIES -> "get_vod_streams"
-            Section.SERIES -> "get_series"
-        }
-        val f = cachedFile(cacheDir, api(action), force)
-        return withContext(Dispatchers.Default) {
-            try {
-                parseArray(f, ITEM_KEYS) { o ->
-                    val id = (if (sec == Section.SERIES) o["series_id"] else o["stream_id"])
-                        ?: return@parseArray null
-                    Item(
-                        id = id,
-                        name = o["name"] ?: "Sin nombre",
-                        icon = (if (sec == Section.SERIES) o["cover"] else o["stream_icon"])
-                            ?.takeIf { it.isNotBlank() },
-                        added = (o["added"] ?: o["last_modified"])?.toLongOrNull() ?: 0L,
-                        categoryId = (o["category_id"] ?: "").intern(),   // textos repetidos: se comparte una sola copia
-                        ext = (o["container_extension"] ?: "mp4").intern(),
-                        section = sec
-                    )
-                }.distinctBy { it.id }   // algunos paneles repiten ids y eso rompía las listas
-            } catch (e: Exception) {
-                f.delete()
-                error("El servidor no devolvió datos válidos (revisa la URL)")
-            }
-        }
     }
 
     override suspend fun episodes(item: Item): List<Episode> {
@@ -317,12 +390,16 @@ class XtreamApi(
                 val eo = e as? JsonObject ?: return@forEach
                 val id = eo.s("id") ?: return@forEach
                 val ext = eo.s("container_extension") ?: "mp4"
+                val inf = eo["info"] as? JsonObject
                 out += Episode(
                     id = id,
                     title = eo.s("title") ?: "Episodio",
                     season = eo.s("season")?.toIntOrNull() ?: 1,
                     num = eo.s("episode_num")?.toIntOrNull() ?: 0,
-                    url = "$base/series/$user/$pass/$id.$ext"
+                    url = "$base/series/$user/$pass/$id.$ext",
+                    image = (inf?.s("movie_image") ?: inf?.s("cover_big"))?.takeIf { it.isNotBlank() },
+                    plot = inf?.s("plot") ?: "",
+                    duration = prettyDuration(inf?.s("duration_secs"), inf?.s("duration"))
                 )
             }
         }
@@ -334,7 +411,7 @@ class XtreamApi(
         else -> "$base/movie/$user/$pass/${item.id}.${item.ext}"
     }
 
-    /** Guía: programa actual y los siguientes (si el proveedor la incluye). */
+    /** Programa actual y los dos siguientes (si el proveedor incluye guía). */
     override suspend fun nowPlaying(item: Item): String? {
         if (item.section != Section.LIVE) return null
         val o = json(api("get_short_epg", "&stream_id=${item.id}&limit=3")) as? JsonObject ?: return null
@@ -343,11 +420,32 @@ class XtreamApi(
         val lines = list.mapNotNull { el ->
             val e = el as? JsonObject ?: return@mapNotNull null
             val raw = e.s("title") ?: return@mapNotNull null
-            val title = runCatching { String(Base64.decode(raw, Base64.DEFAULT), Charsets.UTF_8) }.getOrDefault(raw)
+            val title = b64(raw)
             val ts = e.s("start_timestamp")?.toLongOrNull()
             if (ts != null) "${fmt.format(Date(ts * 1000))}  $title" else title
         }
         return lines.joinToString("\n").ifBlank { null }
+    }
+
+    /** Programación completa del canal (lo que queda del día). */
+    override suspend fun schedule(item: Item): List<String> {
+        if (item.section != Section.LIVE) return emptyList()
+        val o = json(api("get_simple_data_table", "&stream_id=${item.id}")) as? JsonObject ?: return emptyList()
+        val list = o["epg_listings"] as? JsonArray ?: return emptyList()
+        val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+        val now = System.currentTimeMillis() / 1000
+        val lines = ArrayList<String>()
+        for (el in list) {
+            val e = el as? JsonObject ?: continue
+            val raw = e.s("title") ?: continue
+            val start = e.s("start_timestamp")?.toLongOrNull() ?: continue
+            val stop = e.s("stop_timestamp")?.toLongOrNull() ?: continue
+            if (stop <= now) continue
+            val prefix = if (start <= now) "AHORA   " else ""
+            lines.add(prefix + fmt.format(Date(start * 1000)) + "   " + b64(raw))
+            if (lines.size >= 16) break
+        }
+        return lines
     }
 }
 
@@ -394,6 +492,28 @@ class M3uSource(private val url: String, private val cacheDir: File) : IptvSourc
         (ensure(false).episodes[item.id] ?: emptyList()).sortedWith(compareBy({ it.season }, { it.num }))
 
     override fun playUrl(item: Item, liveExt: String): String = item.url
+
+    override suspend fun search(query: String, hideAdult: Boolean): List<Item> {
+        val p = ensure(false)
+        val out = ArrayList<Item>()
+        for (sec in Section.values()) {
+            val adult = if (hideAdult) {
+                (p.cats[sec] ?: emptyList()).filter { isAdult(it.name) }.map { it.id }.toSet()
+            } else {
+                emptySet()
+            }
+            out.addAll(
+                (p.items[sec] ?: emptyList())
+                    .filter { it.name.contains(query, ignoreCase = true) && it.categoryId !in adult }
+                    .take(60)
+            )
+        }
+        return out
+    }
+
+    override suspend fun prefetch() {
+        cachedFile(cacheDir, url, true)
+    }
 
     private fun parse(lines: Sequence<String>): Parsed {
         val items = Section.values().associateWith { mutableListOf<Item>() }

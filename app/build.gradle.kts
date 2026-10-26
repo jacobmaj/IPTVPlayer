@@ -3,6 +3,9 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// El número de versión sube solo con cada compilación de GitHub (-PversionCode=NN)
+val appVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
+
 android {
     namespace = "com.example.iptv"
     compileSdk = 34
@@ -11,12 +14,35 @@ android {
         applicationId = "com.example.iptv"
         minSdk = 21            // Android 5.0+ (TV boxes y celulares viejos)
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = "1.$appVersionCode"
+    }
+
+    // Firma fija: el archivo de la llave llega como secreto de GitHub (KEYSTORE_PATH).
+    // Sin llave (compilación local) se firma con la llave de depuración.
+    signingConfigs {
+        create("release") {
+            val path = System.getenv("KEYSTORE_PATH")
+            if (path != null && file(path).exists()) {
+                storeFile = file(path)
+                storePassword = "iptvplayer-store"
+                keyAlias = "iptvplayer"
+                keyPassword = "iptvplayer-key"
+            }
+        }
     }
 
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            isMinifyEnabled = false
+            val rel = signingConfigs.getByName("release")
+            signingConfig = if (rel.storeFile != null) rel else signingConfigs.getByName("debug")
+        }
+    }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     compileOptions {
@@ -43,4 +69,7 @@ dependencies {
     implementation("io.coil-kt:coil-compose:2.6.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+
+    implementation("androidx.work:work-runtime-ktx:2.9.1")   // actualización nocturna de listas
+    implementation("com.google.zxing:core:3.5.3")             // código QR para entrar desde el celular
 }

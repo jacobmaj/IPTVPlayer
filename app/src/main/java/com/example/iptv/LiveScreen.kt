@@ -36,11 +36,13 @@ fun LiveScreen(vm: AppVM) {
         if (hide && adultIds.isNotEmpty()) vm.items.filter { it.categoryId !in adultIds } else vm.items
     }
     val sorted = remember(base, vm.sort) { sortItems(base, vm.sort) }
-    val channels = remember(sorted, vm.category, vm.query, vm.favs) {
+    val recent = remember(base, vm.history, vm.section) { historyItems(vm, base) }
+    val channels = remember(sorted, recent, vm.category, vm.query, vm.favs) {
         val cat = vm.category
-        sorted.filter {
+        val pool = if (cat == RECENT) recent else sorted
+        pool.filter {
             val okCat = when (cat) {
-                null -> true
+                null, RECENT -> true
                 FAV -> vm.isFav(it)
                 else -> it.categoryId == cat
             }
@@ -48,8 +50,10 @@ fun LiveScreen(vm: AppVM) {
         }
     }
 
+    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    NavBar(vm, Section.LIVE) { dlg = Dlg.MENU }
     Row(
-        Modifier.fillMaxSize().padding(16.dp),
+        Modifier.fillMaxWidth().weight(1f),
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         // Columna 1: categorías
@@ -57,10 +61,9 @@ fun LiveScreen(vm: AppVM) {
             Modifier.width(220.dp).fillMaxHeight(),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            item { ListChip("← Inicio", false) { vm.goHome() } }
-            item { ListChip("Menú", false) { dlg = Dlg.MENU } }
             item { ListChip("Todos", vm.category == null && !searching) { vm.closeCategory() } }
-            item { ListChip("★ Favoritos", vm.category == FAV) { vm.category = FAV } }
+            item { ListChip("Mi lista", vm.category == FAV) { vm.category = FAV } }
+            item { ListChip("Recientes", vm.category == RECENT) { vm.category = RECENT } }
             items(cats, key = { it.id }) { c ->
                 ListChip(c.name, vm.category == c.id) { vm.category = c.id }
             }
@@ -70,7 +73,8 @@ fun LiveScreen(vm: AppVM) {
         Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             val head = when {
                 searching -> "Resultados: ${vm.query}   (${channels.size})"
-                vm.category == FAV -> "★ Favoritos   (${channels.size})"
+                vm.category == FAV -> "Mi lista   (${channels.size})"
+                vm.category == RECENT -> "Canales recientes   (${channels.size})"
                 vm.category != null -> (cats.firstOrNull { it.id == vm.category }?.name ?: "") + "   (${channels.size})"
                 else -> "Todos los canales   (${channels.size})"
             }
@@ -89,8 +93,17 @@ fun LiveScreen(vm: AppVM) {
                             selected = vm.liveSel?.id == ch.id,
                             fav = vm.isFav(ch),
                             onClick = {
-                                // Primer OK: vista previa. OK sobre el canal ya elegido: pantalla completa.
-                                if (vm.liveSel?.id == ch.id) vm.fullscreenLive() else vm.selectLive(ch, channels)
+                                if (!vm.previewAllowed) {
+                                    // Cuenta de una sola conexión: directo a pantalla completa
+                                    vm.liveSel = ch
+                                    vm.open(ch, channels)
+                                } else if (vm.liveSel?.id == ch.id) {
+                                    // OK sobre el canal ya elegido: pantalla completa
+                                    vm.fullscreenLive()
+                                } else {
+                                    // Primer OK: vista previa
+                                    vm.selectLive(ch, channels)
+                                }
                             },
                             onLongClick = { vm.toggleFav(ch) }
                         )
@@ -105,21 +118,34 @@ fun LiveScreen(vm: AppVM) {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             val sel = vm.liveSel
-            PreviewPlayer(
-                url = sel?.let { vm.urlOf(it) },
-                opts = vm.opts,
-                modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)
-            ) { vm.fullscreenLive() }
+            if (vm.previewAllowed) {
+                PreviewPlayer(
+                    url = sel?.let { vm.urlOf(it) },
+                    opts = vm.opts,
+                    modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+                ) { vm.fullscreenLive() }
+            } else {
+                Text(
+                    "Tu cuenta permite una sola conexión, así que la vista previa está desactivada. " +
+                        "Pulsa OK sobre un canal para verlo en pantalla completa.",
+                    color = Color.Gray, fontSize = 12.sp
+                )
+            }
             if (sel != null) {
                 Text(sel.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 vm.epgNow?.let { Text(it, color = Color.LightGray, fontSize = 13.sp) }
+                Chip("Guía del canal") {
+                    vm.loadGuide()
+                    dlg = Dlg.GUIDE
+                }
             }
             Text(
                 "OK sobre el canal elegido o sobre el video: pantalla completa.  CH+ / CH-: cambiar de canal.  " +
-                    "Mantén pulsado OK o pulsa MENÚ: favorito.",
+                    "Mantén pulsado OK o pulsa MENÚ: agregar a Mi lista.",
                 color = Color.Gray, fontSize = 11.sp
             )
         }
+    }
     }
 
     AppDialogs(vm, true, dlg) { dlg = it }
@@ -132,7 +158,7 @@ private fun ListChip(text: String, selected: Boolean, onClick: () -> Unit) {
             text, color = Color.White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .fillMaxWidth()
-                .background(if (selected) Color(0xFF1E88E5) else Color(0xFF232A35))
+                .background(if (selected) Color(0xFFE50914) else Color(0xFF2B2B2B))
                 .padding(horizontal = 12.dp, vertical = 10.dp)
         )
     }
@@ -144,7 +170,7 @@ private fun ChannelRow(ch: Item, selected: Boolean, fav: Boolean, onClick: () ->
         Row(
             Modifier
                 .fillMaxWidth()
-                .background(if (selected) Color(0xFF1E88E5) else Color(0xFF1A212B))
+                .background(if (selected) Color(0xFFE50914) else Color(0xFF1F1F1F))
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -153,7 +179,7 @@ private fun ChannelRow(ch: Item, selected: Boolean, fav: Boolean, onClick: () ->
                 model = ch.icon,
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
-                modifier = Modifier.width(56.dp).height(36.dp).background(Color(0xFF11161D))
+                modifier = Modifier.width(56.dp).height(36.dp).background(Color(0xFF181818))
             )
             Text(
                 ch.name, color = Color.White, fontSize = 14.sp, maxLines = 1,
