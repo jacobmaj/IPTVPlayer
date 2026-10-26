@@ -2,6 +2,8 @@ name: Build APK
 on:
   push:
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,9 +18,26 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
-      - name: Compilar APK (debug)
-        run: gradle assembleDebug --stacktrace
+      - name: Preparar llave de firma
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/iptv.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/iptv.jks" >> "$GITHUB_ENV"
+          fi
+      - name: Compilar APK
+        run: gradle assembleRelease -PversionCode=${{ github.run_number }} --stacktrace
+      - name: Renombrar APK
+        run: cp app/build/outputs/apk/release/*.apk IPTVPlayer.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: IPTVPlayer-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: IPTVPlayer-apk
+          path: IPTVPlayer.apk
+      - name: Publicar versión
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: IPTV Player ${{ github.run_number }}
+          files: IPTVPlayer.apk
