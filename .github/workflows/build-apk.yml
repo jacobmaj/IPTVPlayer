@@ -1,43 +1,42 @@
-name: Build APK
+name: Build Android APK
+
 on:
-  push:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
 permissions:
-  contents: write
+  contents: read
+
 jobs:
   build:
+    name: Compile Majano IPTV
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - name: Aceptar licencias del SDK
-        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
-      - name: Preparar llave de firma
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-        run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/iptv.jks"
-            echo "KEYSTORE_PATH=$RUNNER_TEMP/iptv.jks" >> "$GITHUB_ENV"
-          fi
-      - name: Compilar APK
-        run: gradle assembleRelease -PversionCode=${{ github.run_number }} --stacktrace
-      - name: Renombrar APK
-        run: cp app/build/outputs/apk/release/*.apk IPTVPlayer.apk
-      - uses: actions/upload-artifact@v4
+          gradle-version: '8.11.1'
+
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          name: IPTVPlayer-apk
-          path: IPTVPlayer.apk
-      - name: Publicar versión
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}
-          name: IPTV Player ${{ github.run_number }}
-          files: IPTVPlayer.apk
+          name: majano-iptv-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
