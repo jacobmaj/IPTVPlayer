@@ -6,13 +6,13 @@ plugins {
 
 android {
     namespace = "com.majano.iptv"
-    compileSdk = 35
+    compileSdk = 36
     defaultConfig {
         applicationId = "com.majano.iptv"
         minSdk = 23
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.2.1"
     }
     buildFeatures { compose = true }
     compileOptions {
@@ -35,8 +35,10 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
-    implementation("androidx.media3:media3-exoplayer:1.6.1")
-    implementation("androidx.media3:media3-exoplayer-hls:1.6.1")
-    implementation("androidx.media3:media3-ui:1.6.1")
+    implementation("androidx.media3:media3-exoplayer:1.9.0")
+    implementation("androidx.media3:media3-exoplayer-hls:1.9.0")
+    implementation("androidx.media3:media3-ui:1.9.0")
+    // Decodificadores FFmpeg: audio AC3/EAC3/DTS/TrueHD que el teléfono no soporta de fábrica
+    implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.9.0+1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
